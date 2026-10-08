@@ -3,4 +3,5 @@ uvicorn
 psycopg2-binary
 pydantic
 python-dotenv
-mercadopago
+google-api-python-client
+google-auth

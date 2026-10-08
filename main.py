@@ -1,4 +1,6 @@
-import os
+﻿import os
+import json
+import base64
 import psycopg2
 import psycopg2.extras
 from psycopg2 import errors
@@ -6,21 +8,28 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Optional
 
-# Carrega as variáveis do arquivo .env
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+PACKAGE_NAME = os.getenv("PACKAGE_NAME", "app.itsolutions.roterizadorpro")
+GOOGLE_JSON_STR = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+MIGRATION_SQL = "ALTER TABLE assinaturas ADD COLUMN IF NOT EXISTS purchase_token TEXT;"
 
-app = FastAPI(title="API Motorista Pro")
+app = FastAPI(title="API Motorista Pro v2")
 
-# --- CONFIGURAÇÃO DOS PLANOS (Valores Progressivos) ---
-PLANOS = {
-    "mensal": {"dias": 30, "valor": 9.90, "desc": "Assinatura Mensal"},
-    "trimestral": {"dias": 90, "valor": 26.90, "desc": "Assinatura Trimestral"},
-    "semestral": {"dias": 180, "valor": 49.90, "desc": "Assinatura Semestral"},
-    "anual": {"dias": 365, "valor": 94.90, "desc": "Assinatura Anual"}
-}
+# --- CONFIGURAÇÃO GOOGLE PLAY API ---
+def get_android_publisher():
+    if not GOOGLE_JSON_STR:
+        raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON não configurado no .env.")
+    credentials_dict = json.loads(GOOGLE_JSON_STR)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_dict,
+        scopes=["https://www.googleapis.com/auth/androidpublisher"]
+    )
+    return build('androidpublisher', 'v3', credentials=credentials)
 
 # --- MODELOS DE DADOS ---
 class UsuarioNovo(BaseModel):
@@ -44,59 +53,58 @@ class RotaBackup(BaseModel):
     consumo_kml: float
     preco_combustivel: float
 
-class AssinaturaUpdate(BaseModel):
+class PurchaseVerification(BaseModel):
     firebase_uid: str
-    status: str  # Ex: 'ATIVO', 'VENCIDA'
-    plano: str = "mensal" # Aceita 'mensal', 'trimestral', 'semestral', 'anual'
+    subscription_id: str
+    purchase_token: str
 
-
-# --- CONEXÃO COM O NEON ---
+# --- CONEXÃO COM O NEON DB ---
 def get_db_connection():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
+        return psycopg2.connect(DATABASE_URL)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro de conexão com o banco: {str(e)}")
 
+# Banco v2: garante compatibilidade com o modelo de assinatura do Google Play.
+def ensure_purchase_token_column():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(MIGRATION_SQL)
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
 
+@app.on_event("startup")
+def startup_migration():
+    ensure_purchase_token_column()
+
+# --- ROTAS DE USUÁRIO ---
 @app.post("/registrar-usuario")
 def registrar_usuario(user: UsuarioNovo):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
         cursor.execute("""
             INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id)
             VALUES (%s, %s, %s, %s, %s)
         """, (user.firebase_uid, user.nome, user.email, user.cpf, user.android_id))
-        
-        # Concede 7 dias de teste grátis (TRIAL)
+
         data_vencimento = datetime.now() + timedelta(days=7)
-        
         cursor.execute("""
-            INSERT INTO assinaturas (firebase_uid, status, data_vencimento)
-            VALUES (%s, 'TRIAL', %s)
+            INSERT INTO assinaturas (firebase_uid, status, data_vencimento, purchase_token)
+            VALUES (%s, 'TRIAL', %s, NULL)
         """, (user.firebase_uid, data_vencimento))
-        
+
         conn.commit()
         return {"mensagem": "Conta criada com sucesso! 7 dias grátis ativados.", "status_assinatura": "TRIAL"}
-        
-    except errors.UniqueViolation as e:
+    except errors.UniqueViolation:
         conn.rollback()
-        erro_msg = str(e)
-        if "usuarios_cpf_key" in erro_msg:
-            raise HTTPException(status_code=400, detail="Este CPF já foi utilizado no período de testes.")
-        elif "usuarios_android_id_key" in erro_msg:
-            raise HTTPException(status_code=400, detail="Este dispositivo já esgotou o limite de contas grátis.")
-        else:
-            raise HTTPException(status_code=400, detail="E-mail já cadastrado.")
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail="Credenciais já utilizadas (CPF, Email ou Dispositivo).")
     finally:
         cursor.close()
         conn.close()
-
 
 @app.delete("/deletar-usuario/{firebase_uid}")
 def deletar_usuario(firebase_uid: str):
@@ -106,16 +114,11 @@ def deletar_usuario(firebase_uid: str):
         cursor.execute("DELETE FROM assinaturas WHERE firebase_uid = %s;", (firebase_uid,))
         cursor.execute("DELETE FROM historico_rotas WHERE firebase_uid = %s;", (firebase_uid,))
         cursor.execute("DELETE FROM usuarios WHERE firebase_uid = %s;", (firebase_uid,))
-        
         conn.commit()
-        return {"mensagem": "Usuário e todos os seus dados foram excluídos com sucesso."}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Erro ao excluir dados do servidor: {str(e)}")
+        return {"mensagem": "Usuário e dados excluídos."}
     finally:
         cursor.close()
         conn.close()
-
 
 @app.get("/status-assinatura/{firebase_uid}")
 def status_assinatura(firebase_uid: str):
@@ -124,53 +127,98 @@ def status_assinatura(firebase_uid: str):
     try:
         cursor.execute("SELECT status, data_vencimento FROM assinaturas WHERE firebase_uid = %s;", (firebase_uid,))
         assinatura = cursor.fetchone()
-        
+
         if assinatura:
-            status_atual = assinatura[0]
-            data_vencimento = assinatura[1]
-            
-            # Verifica se o período expirou
-            if datetime.now(data_vencimento.tzinfo) > data_vencimento and status_atual != 'ATIVO':
+            status_atual, data_vencimento = assinatura[0], assinatura[1]
+            if datetime.now(data_vencimento.tzinfo) > data_vencimento and status_atual not in ['ATIVO']:
                 cursor.execute("UPDATE assinaturas SET status = 'VENCIDA' WHERE firebase_uid = %s", (firebase_uid,))
                 conn.commit()
                 return {"status": "VENCIDA", "bloquear_app": True}
-                
             return {"status": status_atual, "bloquear_app": False, "vence_em": data_vencimento}
-            
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     finally:
         cursor.close()
         conn.close()
 
-
-@app.post("/atualizar-assinatura")
-def atualizar_assinatura(req: AssinaturaUpdate):
-    """Rota usada pelo app (Google Billing) para ativar a assinatura com base no plano escolhido."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# --- INTEGRAÇÃO GOOGLE PLAY BILLING ---
+@app.post("/subscription/verify")
+def verify_subscription(req: PurchaseVerification):
     try:
-        plano_info = PLANOS.get(req.plano.lower(), PLANOS["mensal"])
-        nova_data_vencimento = datetime.now() + timedelta(days=plano_info["dias"])
-        
-        cursor.execute("""
-            UPDATE assinaturas 
-            SET status = %s, data_vencimento = %s 
-            WHERE firebase_uid = %s
-        """, (req.status, nova_data_vencimento, req.firebase_uid))
-        conn.commit()
-        return {"mensagem": f"Assinatura {req.plano} atualizada com sucesso na nuvem!", "nova_data": nova_data_vencimento}
+        publisher = get_android_publisher()
+        sub_info = publisher.purchases().subscriptions().get(
+            packageName=PACKAGE_NAME,
+            subscriptionId=req.subscription_id,
+            token=req.purchase_token
+        ).execute()
+
+        payment_state = sub_info.get("paymentState")
+        if payment_state not in [1, 2]:
+            raise HTTPException(status_code=400, detail="Pagamento não confirmado pela Google.")
+
+        expiry_time_millis = int(sub_info.get("expiryTimeMillis", 0))
+        expiry_date = datetime.fromtimestamp(expiry_time_millis / 1000.0)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE assinaturas
+                SET status = 'ATIVO', data_vencimento = %s, purchase_token = %s
+                WHERE firebase_uid = %s
+            """, (expiry_date, req.purchase_token, req.firebase_uid))
+            conn.commit()
+            return {"mensagem": "Assinatura validada com sucesso!", "vence_em": expiry_date}
+        finally:
+            cursor.close()
+            conn.close()
+
     except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
+        raise HTTPException(status_code=500, detail=f"Falha na validação: {str(e)}")
 
+@app.post("/webhooks/google-play")
+async def google_play_webhook(request: Request):
+    try:
+        payload = await request.json()
+        message = payload.get("message", {})
+        data_base64 = message.get("data", "")
 
-# ==========================================
-# HISTÓRICO DE ROTAS
-# ==========================================
+        if data_base64:
+            decoded_data = base64.b64decode(data_base64).decode('utf-8')
+            notification = json.loads(decoded_data)
 
+            sub_notification = notification.get("subscriptionNotification")
+            if sub_notification:
+                notification_type = sub_notification.get("notificationType")
+                purchase_token = sub_notification.get("purchaseToken")
+                subscription_id = sub_notification.get("subscriptionId")
+
+                publisher = get_android_publisher()
+                sub_info = publisher.purchases().subscriptions().get(
+                    packageName=PACKAGE_NAME,
+                    subscriptionId=subscription_id,
+                    token=purchase_token
+                ).execute()
+
+                expiry_time_millis = int(sub_info.get("expiryTimeMillis", 0))
+                expiry_date = datetime.fromtimestamp(expiry_time_millis / 1000.0)
+
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                try:
+                    if notification_type in [2, 4]:
+                        cursor.execute("UPDATE assinaturas SET status = 'ATIVO', data_vencimento = %s WHERE purchase_token = %s", (expiry_date, purchase_token))
+                    elif notification_type in [3, 12, 13]:
+                        cursor.execute("UPDATE assinaturas SET status = 'CANCELADA', data_vencimento = %s WHERE purchase_token = %s", (expiry_date, purchase_token))
+                    conn.commit()
+                finally:
+                    cursor.close()
+                    conn.close()
+
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+# --- HISTÓRICO DE ROTAS ---
 @app.post("/salvar-historico")
 def salvar_historico(rota: RotaBackup):
     conn = get_db_connection()
@@ -183,67 +231,36 @@ def salvar_historico(rota: RotaBackup):
                 faturamento_bruto, consumo_kml, preco_combustivel
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
-                data_inicio_millis = EXCLUDED.data_inicio_millis,
-                data_fim_millis = EXCLUDED.data_fim_millis,
-                tempo_decorrido_segundos = EXCLUDED.tempo_decorrido_segundos,
-                total_paradas = EXCLUDED.total_paradas,
-                pacotes_entregues = EXCLUDED.pacotes_entregues,
-                pacotes_falhos = EXCLUDED.pacotes_falhos,
-                km_rodados = EXCLUDED.km_rodados,
-                faturamento_bruto = EXCLUDED.faturamento_bruto,
-                consumo_kml = EXCLUDED.consumo_kml,
-                preco_combustivel = EXCLUDED.preco_combustivel
+                data_inicio_millis = EXCLUDED.data_inicio_millis, data_fim_millis = EXCLUDED.data_fim_millis,
+                tempo_decorrido_segundos = EXCLUDED.tempo_decorrido_segundos, total_paradas = EXCLUDED.total_paradas,
+                pacotes_entregues = EXCLUDED.pacotes_entregues, pacotes_falhos = EXCLUDED.pacotes_falhos,
+                km_rodados = EXCLUDED.km_rodados, faturamento_bruto = EXCLUDED.faturamento_bruto,
+                consumo_kml = EXCLUDED.consumo_kml, preco_combustivel = EXCLUDED.preco_combustivel
         """, (
-            rota.id, rota.firebase_uid, rota.data_inicio_millis, rota.data_fim_millis,
-            rota.tempo_decorrido_segundos, rota.total_paradas, rota.pacotes_entregues,
-            rota.pacotes_falhos, rota.km_rodados, rota.faturamento_bruto,
+            rota.id, rota.firebase_uid, rota.data_inicio_millis, rota.data_fim_millis, rota.tempo_decorrido_segundos,
+            rota.total_paradas, rota.pacotes_entregues, rota.pacotes_falhos, rota.km_rodados, rota.faturamento_bruto,
             rota.consumo_kml, rota.preco_combustivel
         ))
         conn.commit()
-        return {"mensagem": "Histórico salvo/atualizado com sucesso na nuvem!"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"mensagem": "Histórico salvo/atualizado"}
     finally:
         cursor.close()
         conn.close()
-
 
 @app.get("/obter-historico")
 def obter_historico(firebase_uid: str):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        # Define o limite de 6 meses atrás (180 dias) em milissegundos
-        seis_meses_atras = datetime.now() - timedelta(days=180)
-        limite_millis = int(seis_meses_atras.timestamp() * 1000)
-
-        # 1. Exclui automaticamente do banco tudo o que for mais antigo que 6 meses para este usuário
-        cursor.execute("""
-            DELETE FROM historico_rotas 
-            WHERE firebase_uid = %s AND data_fim_millis < %s
-        """, (firebase_uid, limite_millis))
-
-        # 2. Busca apenas o histórico dentro do período de retenção de 6 meses
-        cursor.execute("""
-            SELECT id, data_inicio_millis, data_fim_millis, tempo_decorrido_segundos,
-                   total_paradas, pacotes_entregues, pacotes_falhos, km_rodados,
-                   faturamento_bruto, consumo_kml, preco_combustivel
-            FROM historico_rotas
-            WHERE firebase_uid = %s AND data_fim_millis >= %s
-            ORDER BY data_fim_millis DESC
-        """, (firebase_uid, limite_millis))
-        
+        limite_millis = int((datetime.now() - timedelta(days=180)).timestamp() * 1000)
+        cursor.execute("DELETE FROM historico_rotas WHERE firebase_uid = %s AND data_fim_millis < %s", (firebase_uid, limite_millis))
+        cursor.execute("SELECT * FROM historico_rotas WHERE firebase_uid = %s AND data_fim_millis >= %s ORDER BY data_fim_millis DESC", (firebase_uid, limite_millis))
         rotas = cursor.fetchall()
-        conn.commit() # Confirma a exclusão dos registos antigos no banco
+        conn.commit()
         return rotas
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cursor.close()
         conn.close()
-
 
 @app.delete("/deletar-historico/{rota_id}")
 def deletar_historico(rota_id: str):
@@ -251,15 +268,8 @@ def deletar_historico(rota_id: str):
     cursor = conn.cursor()
     try:
         cursor.execute("DELETE FROM historico_rotas WHERE id = %s;", (rota_id,))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Rota não encontrada no histórico.")
         conn.commit()
-        return {"mensagem": "Rota deletada com sucesso do histórico."}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"mensagem": "Deletado"}
     finally:
         cursor.close()
         conn.close()
