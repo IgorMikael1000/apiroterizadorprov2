@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+firebase-admin
 psycopg2-binary
 pydantic
 python-dotenv

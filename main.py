@@ -4,15 +4,19 @@ import base64
 import binascii
 import logging
 import traceback
+import firebase_admin
 import psycopg2
 import psycopg2.extras
 from psycopg2 import errors
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from firebase_admin import auth, credentials
+from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
 from google.oauth2 import service_account
+from google.auth.transport import requests as google_auth_requests
+from google.oauth2 import id_token
 from googleapiclient.discovery import build
 from googleapiclient.http import HttpRequest
 
@@ -20,6 +24,10 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 PACKAGE_NAME = os.getenv("PACKAGE_NAME", "app.itsolutions.roterizadorpro")
 GOOGLE_JSON_STR = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+FIREBASE_JSON_STR = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+GOOGLE_PUBSUB_AUDIENCE = os.getenv("GOOGLE_PUBSUB_AUDIENCE")
+GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL")
 MIGRATION_SQL = "ALTER TABLE assinaturas ADD COLUMN IF NOT EXISTS purchase_token TEXT;"
 BLOCK_APP_MIGRATION_SQL = (
     "ALTER TABLE assinaturas "
@@ -76,14 +84,16 @@ def get_android_publisher():
 
 # --- MODELOS DE DADOS ---
 class UsuarioNovo(BaseModel):
-    firebase_uid: str
+    model_config = ConfigDict(extra="forbid")
+
     nome: str
     email: str
     cpf: str
 
 class RotaBackup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
-    firebase_uid: str
     data_inicio_millis: int
     data_fim_millis: int
     tempo_decorrido_segundos: int
@@ -96,9 +106,109 @@ class RotaBackup(BaseModel):
     preco_combustivel: float
 
 class PurchaseVerification(BaseModel):
-    firebase_uid: str
+    model_config = ConfigDict(extra="forbid")
+
     subscription_id: str
     purchase_token: str
+
+
+def verify_firebase_token(request: Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Token Firebase ausente ou inválido.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        try:
+            firebase_app = firebase_admin.get_app()
+        except ValueError:
+            service_account_json = FIREBASE_JSON_STR or GOOGLE_JSON_STR
+            if service_account_json:
+                credential = credentials.Certificate(json.loads(service_account_json))
+                options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+                firebase_app = firebase_admin.initialize_app(credential, options=options)
+            else:
+                options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+                firebase_app = firebase_admin.initialize_app(options=options)
+    except Exception as exc:
+        logger.exception("Firebase Admin SDK não pôde ser inicializado.")
+        raise HTTPException(
+            status_code=503,
+            detail="Serviço de autenticação temporariamente indisponível.",
+        ) from exc
+
+
+def verify_google_pubsub_token(request: Request) -> None:
+    if not GOOGLE_PUBSUB_AUDIENCE or not GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL:
+        logger.error("Audience ou service account do Pub/Sub não configurada.")
+        raise HTTPException(
+            status_code=503,
+            detail="Autenticação do webhook não está configurada.",
+        )
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Token OIDC do Pub/Sub ausente ou inválido.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        claims = id_token.verify_oauth2_token(
+            token,
+            google_auth_requests.Request(),
+            audience=GOOGLE_PUBSUB_AUDIENCE,
+        )
+        if (
+            claims.get("email") != GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL
+            or claims.get("email_verified") is not True
+        ):
+            raise HTTPException(status_code=401, detail="Identidade do Pub/Sub inválida.")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Token OIDC do Pub/Sub inválido ou expirado.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Falha ao validar token OIDC do Pub/Sub.")
+        raise HTTPException(
+            status_code=503,
+            detail="Não foi possível validar a identidade do Pub/Sub.",
+        ) from exc
+
+    try:
+        decoded_token = auth.verify_id_token(
+            token,
+            app=firebase_app,
+            check_revoked=True,
+        )
+        uid = decoded_token.get("uid")
+        if not uid:
+            raise HTTPException(status_code=401, detail="Token Firebase inválido.")
+        return uid
+    except HTTPException:
+        raise
+    except (auth.InvalidIdTokenError, auth.ExpiredIdTokenError, auth.RevokedIdTokenError, auth.UserDisabledError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Token Firebase inválido ou expirado.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Falha ao consultar o Firebase para validar o token.")
+        raise HTTPException(
+            status_code=503,
+            detail="Serviço de autenticação temporariamente indisponível.",
+        ) from exc
 
 # --- CONEXÃO COM O NEON DB ---
 def get_db_connection():
@@ -125,7 +235,7 @@ def startup_migration():
 
 # --- ROTAS DE USUÁRIO ---
 @app.post("/registrar-usuario")
-def registrar_usuario(user: UsuarioNovo):
+def registrar_usuario(user: UsuarioNovo, firebase_uid: str = Depends(verify_firebase_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -136,18 +246,18 @@ def registrar_usuario(user: UsuarioNovo):
                 nome = EXCLUDED.nome,
                 email = EXCLUDED.email,
                 cpf = EXCLUDED.cpf
-        """, (user.firebase_uid, user.nome, user.email, user.cpf))
+        """, (firebase_uid, user.nome, user.email, user.cpf))
 
         data_vencimento = datetime.now() + timedelta(days=7)
         cursor.execute("""
             INSERT INTO assinaturas (firebase_uid, status, data_vencimento, purchase_token)
             VALUES (%s, 'TRIAL', %s, NULL)
             ON CONFLICT (firebase_uid) DO NOTHING
-        """, (user.firebase_uid, data_vencimento))
+        """, (firebase_uid, data_vencimento))
 
         cursor.execute(
             "SELECT status FROM assinaturas WHERE firebase_uid = %s",
-            (user.firebase_uid,),
+            (firebase_uid,),
         )
         assinatura = cursor.fetchone()
         conn.commit()
@@ -163,7 +273,7 @@ def registrar_usuario(user: UsuarioNovo):
         ) from exc
     except Exception as exc:
         conn.rollback()
-        logger.exception("Falha ao sincronizar perfil do usuário %s.", user.firebase_uid)
+        logger.exception("Falha ao sincronizar perfil do usuário %s.", firebase_uid)
         raise HTTPException(
             status_code=500,
             detail="Não foi possível sincronizar o perfil do usuário.",
@@ -172,8 +282,8 @@ def registrar_usuario(user: UsuarioNovo):
         cursor.close()
         conn.close()
 
-@app.delete("/deletar-usuario/{firebase_uid}")
-def deletar_usuario(firebase_uid: str):
+@app.delete("/deletar-usuario")
+def deletar_usuario(firebase_uid: str = Depends(verify_firebase_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -186,8 +296,8 @@ def deletar_usuario(firebase_uid: str):
         cursor.close()
         conn.close()
 
-@app.get("/status-assinatura/{firebase_uid}")
-def status_assinatura(firebase_uid: str):
+@app.get("/status-assinatura")
+def status_assinatura(firebase_uid: str = Depends(verify_firebase_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -228,10 +338,13 @@ def status_assinatura(firebase_uid: str):
 
 # --- INTEGRAÇÃO GOOGLE PLAY BILLING ---
 @app.post("/subscription/verify")
-def verify_subscription(req: PurchaseVerification):
+def verify_subscription(
+    req: PurchaseVerification,
+    firebase_uid: str = Depends(verify_firebase_token),
+):
     try:
         print(
-            f"Iniciando verificação para o usuário: {req.firebase_uid}, "
+            f"Iniciando verificação para o usuário: {firebase_uid}, "
             f"produto: {req.subscription_id}"
         )
         publisher = get_android_publisher()
@@ -287,20 +400,20 @@ def verify_subscription(req: PurchaseVerification):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            print(f"Atualizando assinatura no banco para o usuário: {req.firebase_uid}")
+            print(f"Atualizando assinatura no banco para o usuário: {firebase_uid}")
             cursor.execute("""
                 UPDATE assinaturas
                 SET status = 'ATIVO', data_vencimento = %s, purchase_token = %s
                 WHERE firebase_uid = %s
-            """, (expiry_date, req.purchase_token, req.firebase_uid))
+            """, (expiry_date, req.purchase_token, firebase_uid))
             print(
                 "UPDATE de assinatura executado. "
-                f"Usuário: {req.firebase_uid}; linhas afetadas: {cursor.rowcount}"
+                f"Usuário: {firebase_uid}; linhas afetadas: {cursor.rowcount}"
             )
             if cursor.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Assinatura do usuário não encontrada.")
             conn.commit()
-            print(f"Assinatura atualizada com sucesso para o usuário: {req.firebase_uid}")
+            print(f"Assinatura atualizada com sucesso para o usuário: {firebase_uid}")
             return {
                 "status": "success",
                 "message": "Assinatura verificada e atualizada com sucesso",
@@ -325,7 +438,10 @@ def verify_subscription(req: PurchaseVerification):
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @app.post("/webhooks/google-play")
-async def google_play_webhook(request: Request):
+async def google_play_webhook(
+    request: Request,
+    _: None = Depends(verify_google_pubsub_token),
+):
     try:
         try:
             payload = await request.json()
@@ -541,7 +657,10 @@ async def google_play_webhook(request: Request):
 
 # --- HISTÓRICO DE ROTAS ---
 @app.post("/salvar-historico")
-def salvar_historico(rota: RotaBackup):
+def salvar_historico(
+    rota: RotaBackup,
+    firebase_uid: str = Depends(verify_firebase_token),
+):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -557,11 +676,14 @@ def salvar_historico(rota: RotaBackup):
                 pacotes_entregues = EXCLUDED.pacotes_entregues, pacotes_falhos = EXCLUDED.pacotes_falhos,
                 km_rodados = EXCLUDED.km_rodados, faturamento_bruto = EXCLUDED.faturamento_bruto,
                 consumo_kml = EXCLUDED.consumo_kml, preco_combustivel = EXCLUDED.preco_combustivel
+            WHERE historico_rotas.firebase_uid = EXCLUDED.firebase_uid
         """, (
-            rota.id, rota.firebase_uid, rota.data_inicio_millis, rota.data_fim_millis, rota.tempo_decorrido_segundos,
+            rota.id, firebase_uid, rota.data_inicio_millis, rota.data_fim_millis, rota.tempo_decorrido_segundos,
             rota.total_paradas, rota.pacotes_entregues, rota.pacotes_falhos, rota.km_rodados, rota.faturamento_bruto,
             rota.consumo_kml, rota.preco_combustivel
         ))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=403, detail="Rota pertence a outro usuário.")
         conn.commit()
         return {"mensagem": "Histórico salvo/atualizado"}
     finally:
@@ -569,7 +691,7 @@ def salvar_historico(rota: RotaBackup):
         conn.close()
 
 @app.get("/obter-historico")
-def obter_historico(firebase_uid: str):
+def obter_historico(firebase_uid: str = Depends(verify_firebase_token)):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
@@ -584,11 +706,19 @@ def obter_historico(firebase_uid: str):
         conn.close()
 
 @app.delete("/deletar-historico/{rota_id}")
-def deletar_historico(rota_id: str):
+def deletar_historico(
+    rota_id: str,
+    firebase_uid: str = Depends(verify_firebase_token),
+):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("DELETE FROM historico_rotas WHERE id = %s;", (rota_id,))
+        cursor.execute(
+            "DELETE FROM historico_rotas WHERE id = %s AND firebase_uid = %s;",
+            (rota_id, firebase_uid),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Rota não encontrada.")
         conn.commit()
         return {"mensagem": "Deletado"}
     finally:
