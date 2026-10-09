@@ -116,9 +116,10 @@ def verify_firebase_token(request: Request) -> str:
     authorization = request.headers.get("Authorization", "")
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
+        logger.error("Falha: Token JWT ausente no cabeçalho Authorization.")
         raise HTTPException(
             status_code=401,
-            detail="Token Firebase ausente ou inválido.",
+            detail="Token ausente.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -136,6 +137,44 @@ def verify_firebase_token(request: Request) -> str:
                 firebase_app = firebase_admin.initialize_app(options=options)
     except Exception as exc:
         logger.exception("Firebase Admin SDK não pôde ser inicializado.")
+        raise HTTPException(
+            status_code=503,
+            detail="Serviço de autenticação temporariamente indisponível.",
+        ) from exc
+
+    try:
+        decoded_token = auth.verify_id_token(
+            token,
+            app=firebase_app,
+            check_revoked=True,
+        )
+        uid = decoded_token.get("uid")
+        if not uid:
+            logger.error("Falha na validação do token Firebase: UID ausente no token.")
+            raise HTTPException(status_code=401, detail="Token inválido.")
+        logger.info("Token Firebase validado com sucesso para o UID: %s", uid)
+        return uid
+    except HTTPException:
+        raise
+    except (
+        auth.InvalidIdTokenError,
+        auth.ExpiredIdTokenError,
+        auth.RevokedIdTokenError,
+        auth.UserDisabledError,
+        ValueError,
+    ) as exc:
+        logger.warning(
+            "Falha na validação do token Firebase (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Token inválido ou expirado.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Falha inesperada ao validar token Firebase.")
         raise HTTPException(
             status_code=503,
             detail="Serviço de autenticação temporariamente indisponível.",
@@ -183,31 +222,6 @@ def verify_google_pubsub_token(request: Request) -> None:
         raise HTTPException(
             status_code=503,
             detail="Não foi possível validar a identidade do Pub/Sub.",
-        ) from exc
-
-    try:
-        decoded_token = auth.verify_id_token(
-            token,
-            app=firebase_app,
-            check_revoked=True,
-        )
-        uid = decoded_token.get("uid")
-        if not uid:
-            raise HTTPException(status_code=401, detail="Token Firebase inválido.")
-        return uid
-    except HTTPException:
-        raise
-    except (auth.InvalidIdTokenError, auth.ExpiredIdTokenError, auth.RevokedIdTokenError, auth.UserDisabledError, ValueError) as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Token Firebase inválido ou expirado.",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-    except Exception as exc:
-        logger.exception("Falha ao consultar o Firebase para validar o token.")
-        raise HTTPException(
-            status_code=503,
-            detail="Serviço de autenticação temporariamente indisponível.",
         ) from exc
 
 # --- CONEXÃO COM O NEON DB ---
