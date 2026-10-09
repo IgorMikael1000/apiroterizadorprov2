@@ -42,6 +42,33 @@ app = FastAPI(
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
+def initialize_firebase_admin():
+    if not FIREBASE_JSON_STR:
+        logger.warning(
+            "FIREBASE_SERVICE_ACCOUNT_JSON não configurada; "
+            "rotas autenticadas ficarão indisponíveis."
+        )
+        return None
+
+    try:
+        try:
+            return firebase_admin.get_app()
+        except ValueError:
+            pass
+
+        credential = credentials.Certificate(json.loads(FIREBASE_JSON_STR))
+        options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+        firebase_app = firebase_admin.initialize_app(credential, options=options)
+        logger.info("Firebase Admin SDK inicializado com credenciais Firebase.")
+        return firebase_app
+    except Exception:
+        logger.exception("Não foi possível inicializar o Firebase Admin SDK.")
+        return None
+
+
+FIREBASE_APP = initialize_firebase_admin()
+
 # --- CONFIGURAÇÃO GOOGLE PLAY API ---
 def build_google_request(
     http,
@@ -123,29 +150,19 @@ def verify_firebase_token(request: Request) -> str:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    try:
-        try:
-            firebase_app = firebase_admin.get_app()
-        except ValueError:
-            service_account_json = FIREBASE_JSON_STR or GOOGLE_JSON_STR
-            if service_account_json:
-                credential = credentials.Certificate(json.loads(service_account_json))
-                options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
-                firebase_app = firebase_admin.initialize_app(credential, options=options)
-            else:
-                options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
-                firebase_app = firebase_admin.initialize_app(options=options)
-    except Exception as exc:
-        logger.exception("Firebase Admin SDK não pôde ser inicializado.")
+    if FIREBASE_APP is None:
+        logger.error(
+            "Firebase Admin SDK indisponível; configure FIREBASE_SERVICE_ACCOUNT_JSON."
+        )
         raise HTTPException(
             status_code=503,
             detail="Serviço de autenticação temporariamente indisponível.",
-        ) from exc
+        )
 
     try:
         decoded_token = auth.verify_id_token(
             token,
-            app=firebase_app,
+            app=FIREBASE_APP,
             check_revoked=True,
         )
         uid = decoded_token.get("uid")
