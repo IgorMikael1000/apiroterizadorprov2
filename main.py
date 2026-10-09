@@ -8,7 +8,7 @@ from psycopg2 import errors
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -184,22 +184,36 @@ def verify_subscription(req: PurchaseVerification):
             f"produto: {req.subscription_id}"
         )
         publisher = get_android_publisher()
-        sub_info = publisher.purchases().subscriptions().get(
+        sub_info = publisher.purchases().subscriptionsv2().get(
             packageName=PACKAGE_NAME,
-            subscriptionId=req.subscription_id,
             token=req.purchase_token
         ).execute()
         print(
             "Resposta da Google Play recebida com sucesso. "
-            f"Estado do pagamento: {sub_info.get('paymentState')}"
+            f"Estado da assinatura: {sub_info.get('subscriptionState')}"
         )
 
-        payment_state = sub_info.get("paymentState")
-        if payment_state not in [1, 2]:
+        subscription_state = sub_info.get("subscriptionState")
+        if subscription_state not in [
+            "SUBSCRIPTION_STATE_ACTIVE",
+            "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+        ]:
             raise HTTPException(status_code=400, detail="Pagamento não confirmado pela Google.")
 
-        expiry_time_millis = int(sub_info.get("expiryTimeMillis", 0))
-        expiry_date = datetime.fromtimestamp(expiry_time_millis / 1000.0)
+        matching_line_items = [
+            item
+            for item in sub_info.get("lineItems", [])
+            if item.get("productId") == req.subscription_id
+        ]
+        if not matching_line_items:
+            raise HTTPException(status_code=400, detail="Produto da assinatura não corresponde.")
+
+        expiry_time = matching_line_items[0].get("expiryTime")
+        if not expiry_time:
+            raise HTTPException(status_code=400, detail="Data de expiração não encontrada na Google.")
+        expiry_date = datetime.fromisoformat(
+            expiry_time.replace("Z", "+00:00")
+        ).astimezone(timezone.utc).replace(tzinfo=None)
 
         conn = get_db_connection()
         cursor = conn.cursor()
