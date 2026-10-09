@@ -80,7 +80,6 @@ class UsuarioNovo(BaseModel):
     nome: str
     email: str
     cpf: str
-    android_id: str
 
 class RotaBackup(BaseModel):
     id: str
@@ -131,21 +130,44 @@ def registrar_usuario(user: UsuarioNovo):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (user.firebase_uid, user.nome, user.email, user.cpf, user.android_id))
+            INSERT INTO usuarios (firebase_uid, nome, email, cpf)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (firebase_uid) DO UPDATE SET
+                nome = EXCLUDED.nome,
+                email = EXCLUDED.email,
+                cpf = EXCLUDED.cpf
+        """, (user.firebase_uid, user.nome, user.email, user.cpf))
 
         data_vencimento = datetime.now() + timedelta(days=7)
         cursor.execute("""
             INSERT INTO assinaturas (firebase_uid, status, data_vencimento, purchase_token)
             VALUES (%s, 'TRIAL', %s, NULL)
+            ON CONFLICT (firebase_uid) DO NOTHING
         """, (user.firebase_uid, data_vencimento))
 
+        cursor.execute(
+            "SELECT status FROM assinaturas WHERE firebase_uid = %s",
+            (user.firebase_uid,),
+        )
+        assinatura = cursor.fetchone()
         conn.commit()
-        return {"mensagem": "Conta criada com sucesso! 7 dias grátis ativados.", "status_assinatura": "TRIAL"}
-    except errors.UniqueViolation:
+        return {
+            "mensagem": "Perfil sincronizado com sucesso.",
+            "status_assinatura": assinatura[0] if assinatura else None,
+        }
+    except errors.UniqueViolation as exc:
         conn.rollback()
-        raise HTTPException(status_code=400, detail="Credenciais já utilizadas (CPF, Email ou Dispositivo).")
+        raise HTTPException(
+            status_code=409,
+            detail="CPF ou e-mail já está associado a outro usuário.",
+        ) from exc
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Falha ao sincronizar perfil do usuário %s.", user.firebase_uid)
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível sincronizar o perfil do usuário.",
+        ) from exc
     finally:
         cursor.close()
         conn.close()
