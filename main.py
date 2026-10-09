@@ -33,6 +33,23 @@ BLOCK_APP_MIGRATION_SQL = (
     "ALTER TABLE assinaturas "
     "ADD COLUMN IF NOT EXISTS bloquear_app BOOLEAN NOT NULL DEFAULT FALSE;"
 )
+TRIAL_DEVICES_MIGRATION_SQL = """
+    DO $$
+    BEGIN
+        IF to_regclass('dispositivos_trial') IS NULL THEN
+            CREATE TABLE dispositivos_trial (
+                android_id TEXT PRIMARY KEY,
+                trial_ativado_em TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO dispositivos_trial (android_id)
+            SELECT DISTINCT android_id
+            FROM usuarios
+            WHERE android_id IS NOT NULL AND btrim(android_id) <> ''
+            ON CONFLICT (android_id) DO NOTHING;
+        END IF;
+    END
+    $$;
+"""
 GOOGLE_API_TIMEOUT_SECONDS = 8
 
 app = FastAPI(
@@ -262,6 +279,11 @@ def ensure_purchase_token_column():
         cursor.execute(MIGRATION_SQL)
         cursor.execute(BLOCK_APP_MIGRATION_SQL)
         cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS android_id TEXT;")
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("migration:dispositivos_trial:v1",),
+        )
+        cursor.execute(TRIAL_DEVICES_MIGRATION_SQL)
         conn.commit()
     finally:
         cursor.close()
@@ -274,20 +296,25 @@ def startup_migration():
 # --- ROTAS DE USUÁRIO ---
 @app.post("/registrar-usuario")
 def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_token)):
+    android_id = user.android_id.strip()
+    if not android_id:
+        raise HTTPException(status_code=422, detail="android_id não pode estar vazio.")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (user.android_id,),
+            (android_id,),
         )
         cursor.execute(
-            "SELECT count(*) FROM usuarios "
-            "WHERE android_id = %s AND firebase_uid != %s",
-            (user.android_id, uid),
+            "SELECT EXISTS ("
+            "SELECT 1 FROM dispositivos_trial WHERE android_id = %s"
+            ")",
+            (android_id,),
         )
-        aparelho_ja_utilizado = cursor.fetchone()[0] > 0
-        status_assinatura = "INATIVO" if aparelho_ja_utilizado else "TRIAL"
+        trial_ja_ativado = cursor.fetchone()[0]
+        status_assinatura = "INATIVO" if trial_ja_ativado else "TRIAL"
 
         cursor.execute("""
             INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id)
@@ -297,7 +324,7 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
                 email = EXCLUDED.email,
                 cpf = EXCLUDED.cpf,
                 android_id = EXCLUDED.android_id
-        """, (uid, user.nome, user.email, user.cpf, user.android_id))
+        """, (uid, user.nome, user.email, user.cpf, android_id))
 
         data_vencimento = (
             datetime.now() + timedelta(days=7)
@@ -309,6 +336,12 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
             VALUES (%s, %s, %s, NULL)
             ON CONFLICT (firebase_uid) DO NOTHING
         """, (uid, status_assinatura, data_vencimento))
+        if status_assinatura == "TRIAL" and cursor.rowcount == 1:
+            cursor.execute(
+                "INSERT INTO dispositivos_trial (android_id) VALUES (%s) "
+                "ON CONFLICT (android_id) DO NOTHING",
+                (android_id,),
+            )
 
         cursor.execute(
             "SELECT status FROM assinaturas WHERE firebase_uid = %s",
