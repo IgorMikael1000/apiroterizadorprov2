@@ -1,6 +1,7 @@
 ﻿import os
 import json
 import base64
+import traceback
 import psycopg2
 import psycopg2.extras
 from psycopg2 import errors
@@ -11,12 +12,14 @@ from datetime import datetime, timedelta
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import HttpRequest
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 PACKAGE_NAME = os.getenv("PACKAGE_NAME", "app.itsolutions.roterizadorpro")
 GOOGLE_JSON_STR = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 MIGRATION_SQL = "ALTER TABLE assinaturas ADD COLUMN IF NOT EXISTS purchase_token TEXT;"
+GOOGLE_API_TIMEOUT_SECONDS = 8
 
 app = FastAPI(
     title="API RoterizadorPro v2",
@@ -24,6 +27,30 @@ app = FastAPI(
 )
 
 # --- CONFIGURAÇÃO GOOGLE PLAY API ---
+def build_google_request(
+    http,
+    postproc,
+    uri,
+    method="GET",
+    body=None,
+    headers=None,
+    methodId=None,
+    resumable=None,
+):
+    transport = getattr(http, "http", http)
+    transport.timeout = GOOGLE_API_TIMEOUT_SECONDS
+    return HttpRequest(
+        http,
+        postproc,
+        uri,
+        method=method,
+        body=body,
+        headers=headers,
+        methodId=methodId,
+        resumable=resumable,
+    )
+
+
 def get_android_publisher():
     if not GOOGLE_JSON_STR:
         raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON não configurado no .env.")
@@ -32,7 +59,12 @@ def get_android_publisher():
         credentials_dict,
         scopes=["https://www.googleapis.com/auth/androidpublisher"]
     )
-    return build('androidpublisher', 'v3', credentials=credentials)
+    return build(
+        'androidpublisher',
+        'v3',
+        credentials=credentials,
+        requestBuilder=build_google_request,
+    )
 
 # --- MODELOS DE DADOS ---
 class UsuarioNovo(BaseModel):
@@ -147,12 +179,20 @@ def status_assinatura(firebase_uid: str):
 @app.post("/subscription/verify")
 def verify_subscription(req: PurchaseVerification):
     try:
+        print(
+            f"Iniciando verificação para o usuário: {req.firebase_uid}, "
+            f"produto: {req.subscription_id}"
+        )
         publisher = get_android_publisher()
         sub_info = publisher.purchases().subscriptions().get(
             packageName=PACKAGE_NAME,
             subscriptionId=req.subscription_id,
             token=req.purchase_token
         ).execute()
+        print(
+            "Resposta da Google Play recebida com sucesso. "
+            f"Estado do pagamento: {sub_info.get('paymentState')}"
+        )
 
         payment_state = sub_info.get("paymentState")
         if payment_state not in [1, 2]:
@@ -164,18 +204,37 @@ def verify_subscription(req: PurchaseVerification):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            print(f"Atualizando assinatura no banco para o usuário: {req.firebase_uid}")
             cursor.execute("""
                 UPDATE assinaturas
                 SET status = 'ATIVO', data_vencimento = %s, purchase_token = %s
                 WHERE firebase_uid = %s
             """, (expiry_date, req.purchase_token, req.firebase_uid))
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Assinatura do usuário não encontrada.")
             conn.commit()
-            return {"mensagem": "Assinatura validada com sucesso!", "vence_em": expiry_date}
+            print(f"Assinatura atualizada com sucesso para o usuário: {req.firebase_uid}")
+            return {
+                "status": "success",
+                "message": "Assinatura verificada e atualizada com sucesso",
+                "mensagem": "Assinatura validada com sucesso!",
+                "vence_em": expiry_date,
+            }
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             cursor.close()
             conn.close()
 
+    except HTTPException as e:
+        if e.status_code >= 500:
+            print(f"ERRO CRÍTICO EM /subscription/verify: {e.detail}")
+            traceback.print_exc()
+        raise
     except Exception as e:
+        print(f"ERRO CRÍTICO EM /subscription/verify: {e!r}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Falha na validação: {str(e)}")
 
 @app.post("/webhooks/google-play")
