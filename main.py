@@ -116,6 +116,7 @@ class UsuarioNovo(BaseModel):
     nome: str
     email: str
     cpf: str
+    android_id: str
 
 class RotaBackup(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -255,6 +256,7 @@ def ensure_purchase_token_column():
     try:
         cursor.execute(MIGRATION_SQL)
         cursor.execute(BLOCK_APP_MIGRATION_SQL)
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS android_id TEXT;")
         conn.commit()
     finally:
         cursor.close()
@@ -270,21 +272,38 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (user.android_id,),
+        )
+        cursor.execute(
+            "SELECT count(*) FROM usuarios "
+            "WHERE android_id = %s AND firebase_uid != %s",
+            (user.android_id, uid),
+        )
+        aparelho_ja_utilizado = cursor.fetchone()[0] > 0
+        status_assinatura = "INATIVO" if aparelho_ja_utilizado else "TRIAL"
+
         cursor.execute("""
-            INSERT INTO usuarios (firebase_uid, nome, email, cpf)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (firebase_uid) DO UPDATE SET
                 nome = EXCLUDED.nome,
                 email = EXCLUDED.email,
-                cpf = EXCLUDED.cpf
-        """, (uid, user.nome, user.email, user.cpf))
+                cpf = EXCLUDED.cpf,
+                android_id = EXCLUDED.android_id
+        """, (uid, user.nome, user.email, user.cpf, user.android_id))
 
-        data_vencimento = datetime.now() + timedelta(days=7)
+        data_vencimento = (
+            datetime.now() + timedelta(days=7)
+            if status_assinatura == "TRIAL"
+            else datetime.now()
+        )
         cursor.execute("""
             INSERT INTO assinaturas (firebase_uid, status, data_vencimento, purchase_token)
-            VALUES (%s, 'TRIAL', %s, NULL)
+            VALUES (%s, %s, %s, NULL)
             ON CONFLICT (firebase_uid) DO NOTHING
-        """, (uid, data_vencimento))
+        """, (uid, status_assinatura, data_vencimento))
 
         cursor.execute(
             "SELECT status FROM assinaturas WHERE firebase_uid = %s",
