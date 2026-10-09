@@ -18,7 +18,10 @@ PACKAGE_NAME = os.getenv("PACKAGE_NAME", "app.itsolutions.roterizadorpro")
 GOOGLE_JSON_STR = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 MIGRATION_SQL = "ALTER TABLE assinaturas ADD COLUMN IF NOT EXISTS purchase_token TEXT;"
 
-app = FastAPI(title="API Motorista Pro v2")
+app = FastAPI(
+    title="API Motorista Pro v2",
+    servers=[{"url": "https://apiroterizadorprov2.vercel.app"}],
+)
 
 # --- CONFIGURAÇÃO GOOGLE PLAY API ---
 def get_android_publisher():
