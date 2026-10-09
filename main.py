@@ -266,7 +266,7 @@ def startup_migration():
 
 # --- ROTAS DE USUÁRIO ---
 @app.post("/registrar-usuario")
-def registrar_usuario(user: UsuarioNovo, firebase_uid: str = Depends(verify_firebase_token)):
+def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -277,18 +277,18 @@ def registrar_usuario(user: UsuarioNovo, firebase_uid: str = Depends(verify_fire
                 nome = EXCLUDED.nome,
                 email = EXCLUDED.email,
                 cpf = EXCLUDED.cpf
-        """, (firebase_uid, user.nome, user.email, user.cpf))
+        """, (uid, user.nome, user.email, user.cpf))
 
         data_vencimento = datetime.now() + timedelta(days=7)
         cursor.execute("""
             INSERT INTO assinaturas (firebase_uid, status, data_vencimento, purchase_token)
             VALUES (%s, 'TRIAL', %s, NULL)
             ON CONFLICT (firebase_uid) DO NOTHING
-        """, (firebase_uid, data_vencimento))
+        """, (uid, data_vencimento))
 
         cursor.execute(
             "SELECT status FROM assinaturas WHERE firebase_uid = %s",
-            (firebase_uid,),
+            (uid,),
         )
         assinatura = cursor.fetchone()
         conn.commit()
@@ -304,7 +304,7 @@ def registrar_usuario(user: UsuarioNovo, firebase_uid: str = Depends(verify_fire
         ) from exc
     except Exception as exc:
         conn.rollback()
-        logger.exception("Falha ao sincronizar perfil do usuário %s.", firebase_uid)
+        logger.exception("Falha ao sincronizar perfil do usuário %s.", uid)
         raise HTTPException(
             status_code=500,
             detail="Não foi possível sincronizar o perfil do usuário.",
