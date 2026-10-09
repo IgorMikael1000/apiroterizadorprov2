@@ -3,6 +3,7 @@ uvicorn
 firebase-admin
 psycopg2-binary
 pydantic
+email-validator
 python-dotenv
 google-api-python-client
 google-auth

@@ -10,7 +10,7 @@ import psycopg2.extras
 from psycopg2 import errors
 from firebase_admin import auth, credentials
 from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
@@ -117,6 +117,11 @@ class UsuarioNovo(BaseModel):
     email: str
     cpf: str
     android_id: str
+
+class AtualizacaoPerfil(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
 
 class RotaBackup(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -327,6 +332,51 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
         raise HTTPException(
             status_code=500,
             detail="Não foi possível sincronizar o perfil do usuário.",
+        ) from exc
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.put("/atualizar-perfil")
+def atualizar_perfil(
+    perfil: AtualizacaoPerfil,
+    firebase_uid: str = Depends(verify_firebase_token),
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE usuarios SET email = %s WHERE firebase_uid = %s",
+            (str(perfil.email), firebase_uid),
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(
+                status_code=404,
+                detail="Perfil do usuário não encontrado.",
+            )
+        conn.commit()
+        return {
+            "status": "success",
+            "mensagem": "E-mail atualizado com sucesso.",
+        }
+    except errors.UniqueViolation as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Este e-mail já está associado a outro usuário.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception(
+            "Falha ao atualizar o e-mail do usuário %s.",
+            firebase_uid,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível atualizar o e-mail do usuário.",
         ) from exc
     finally:
         cursor.close()

@@ -1,0 +1,113 @@
+PROMPT PARA O AGENTE DO ANDROID STUDIO
+
+Atue como Engenheiro Mobile Android Sênior. Alinhe o app Android com o backend FastAPI publicado em:
+
+https://apiroterizadorprov2.vercel.app
+
+IMPORTANTE
+- Inspecione os fontes reais do app antes de editar. Os nomes de arquivo e métodos abaixo são os esperados; se diferirem, localize os equivalentes.
+- Faça as alterações Android descritas neste prompt, preservando os padrões de arquitetura, Retrofit/ApiClient, autenticação, coroutines/threads, UI e tratamento de erros já existentes.
+- Não altere o backend neste trabalho. O endpoint de perfil descrito abaixo já foi implementado neste repositório; ele só estará disponível para o app em produção depois que essas alterações forem publicadas na Vercel.
+- Não considere uma compra validada, um histórico sincronizado ou um perfil atualizado se o servidor não tiver confirmado a operação.
+- Não introduza rotas alternativas, dados de identidade fornecidos pelo cliente ou fallback de sucesso offline.
+- Ao concluir, informe arquivos alterados, decisões relevantes, testes/build executados e qualquer dependência do backend ainda necessária.
+
+1. HISTÓRICO: LER O CAMPO CORRETO DE PACOTES FALHOS
+
+No equivalente a HistoricoRotaManager.kt, localize a leitura da resposta de GET /obter-historico na função de sincronização com a nuvem.
+
+- O backend retorna o campo JSON `pacotes_falhos` (não `total_pacotes_falhos`).
+- Mapeie esse campo para a propriedade Android `totalPacotesFalhos`, usando o valor padrão zero somente quando o valor realmente estiver ausente ou nulo:
+  `totalPacotesFalhos = obj.optInt("pacotes_falhos", 0)`
+- Confira também que a serialização enviada por POST /salvar-historico continua usando `pacotes_falhos`, para manter leitura e escrita consistentes.
+- Não altere o contrato do backend nem renomeie os campos da API.
+- Preserve os demais mapeamentos, ordenação, deduplicação e comportamento de sincronização existentes.
+
+Critério de aceite: uma resposta contendo, por exemplo, `"pacotes_falhos": 3` deve resultar em três pacotes falhos no histórico local, sem afetar os outros campos.
+
+2. GOOGLE PLAY: NÃO INDICAR SUCESSO SEM VALIDAÇÃO DO BACKEND
+
+No equivalente a GoogleBillingManager.kt, localize o fluxo de envio e tratamento da chamada POST /subscription/verify (por exemplo, enviarVerificacaoBackendV2).
+
+O contrato atual do backend:
+- Método/caminho: POST /subscription/verify
+- Autenticação: cabeçalho Authorization no esquema Bearer, contendo o Firebase ID token e fornecido pelo mecanismo compartilhado do app (ApiClient/AuthInterceptor).
+- JSON: `subscription_id` e `purchase_token`.
+- Sucesso de validação: resposta HTTP 2xx com corpo JSON contendo `status: "success"`.
+- Erro: status HTTP não 2xx, erro de autenticação/servidor, resposta inválida ou falha de rede.
+
+Implemente o seguinte:
+- Só execute `onPurchased()` e mostre mensagem de sucesso/ative o acesso premium depois de confirmar uma resposta HTTP 2xx válida e o resultado de sucesso esperado no corpo. Não converta exceções, respostas nulas ou erros HTTP em sucesso.
+- Em erro HTTP ou falha de rede, informe claramente que a compra ainda não pôde ser validada pelo servidor. Não informe que a assinatura foi ativada e não libere o estado premium como se o backend tivesse confirmado.
+- Mantenha o token da compra disponível para nova tentativa. Permita tentar novamente por um mecanismo compatível com o fluxo atual (ação explícita e/ou nova consulta ao BillingClient ao reabrir/retomar o app). Evite perder compras pendentes de validação após rotação, encerramento ou retorno à tela.
+- Evite chamadas concorrentes/repetidas desnecessárias e mantenha o processamento na thread/contexto correto.
+- Siga o tratamento de erros e a apresentação de mensagens já adotados pelo app; não descarte silenciosamente erros relevantes.
+- Inspecione o fluxo de acknowledge/consume da Google Play. Não marque a assinatura como validada no backend só porque a compra foi retornada pelo BillingClient. Se o reconhecimento da compra for feito separadamente para cumprir os requisitos da Play, mantenha claramente separados os estados “compra recebida/reconhecida pela Play” e “assinatura validada/ativada pelo backend”, e preserve a possibilidade de reenviar `purchase_token` ao backend até obter confirmação. Não faça mudanças no fluxo de acknowledge sem verificar as regras e a implementação existente.
+- Use o cliente compartilhado autenticado; não crie uma chamada HTTP paralela sem o Firebase ID token.
+
+Critérios de aceite:
+- HTTP 2xx com sucesso esperado: executar uma única vez o callback de sucesso e atualizar o estado premium.
+- HTTP não 2xx, resposta sem sucesso válido, resposta nula ou erro de rede: não executar `onPurchased()`, não exibir sucesso e permitir nova tentativa.
+- Uma falha temporária de rede não deve tornar impossível validar depois a compra ainda válida.
+
+3. HISTÓRICO: REMOVER O FALLBACK DELETE INEXISTENTE
+
+No equivalente a HistoricoRotaManager.kt, localize a função de exclusão da rota.
+
+- Mantenha como única requisição de exclusão a rota existente:
+  `DELETE /deletar-historico/{rota_id}`
+- Remova o fallback para `DELETE /excluir-historico` e qualquer payload alternativo `{ "id": ... }` associado a essa rota inexistente.
+- Em falha da rota principal, preserve um tratamento explícito e adequado na UI/logs conforme os padrões do app; não apresente a exclusão como concluída e não esconda a falha.
+- Não remova validações ou atualização local que sejam necessárias para o funcionamento correto após uma resposta bem-sucedida.
+
+Critério de aceite: a exclusão realiza uma única chamada ao endpoint oficial; erro HTTP/rede não aciona uma segunda rota e não é tratado como exclusão confirmada.
+
+4. ATUALIZAÇÃO DO E-MAIL: ALINHAR O APP AO ENDPOINT QUE SERÁ ADICIONADO AO BACKEND
+
+O app possui uma chamada planejada/usada para `PUT /atualizar-perfil`. O endpoint já está implementado no código local do backend, com autenticação Firebase e atualização do e-mail do usuário no Neon DB, mas depende de publicação na Vercel para estar disponível em produção.
+
+- Localize o fluxo de alteração de e-mail e determine a ordem atualmente usada entre Firebase Auth e sincronização com o backend.
+- Mantenha a sincronização autenticada pelo ApiClient/AuthInterceptor, sem enviar `firebase_uid` no corpo para escolher qual usuário alterar. O backend derivará o UID do token Firebase.
+- O corpo esperado é JSON com o campo `email`; não envie campos extras. O endpoint responde 2xx somente após confirmar a atualização no banco e retorna `status: "success"` e `mensagem`.
+- Verifique o status HTTP e o resultado da resposta. Não ignore exceções, não exiba sucesso de sincronização em caso de falha e não chame endpoint alternativo.
+- Se a mudança no Firebase Auth já tiver sido concluída e a atualização do Neon falhar, comunique com precisão que o e-mail foi alterado na conta Firebase, mas a sincronização com o servidor está pendente/falhou; preserve o e-mail e permita nova tentativa de sincronização. Não reverta nem repita a alteração no Firebase automaticamente sem seguir o fluxo existente e sem tratar erros de reautenticação.
+- Se o app exigir confirmação/reautenticação do Firebase para alterar o e-mail, preserve esse requisito.
+- Registre explicitamente que a rota já existe no código local, mas ainda precisa estar publicada na Vercel. Não tente contornar a dependência. A versão Android que usa essa rota só deve ser liberada junto de, ou depois de, uma versão implantada do backend que a exponha.
+
+Critérios de aceite:
+- Depois de uma alteração bem-sucedida no Firebase, enviar a sincronização autenticada para `PUT /atualizar-perfil`.
+- Sucesso só é informado quando a etapa de sincronização que a UI promete tiver sido confirmada.
+- HTTP não 2xx/falha de rede não é ignorado; o usuário recebe estado claro e pode repetir a sincronização.
+
+5. AUTENTICAÇÃO E COMPATIBILIDADE
+
+- Reutilize o AuthInterceptor/ApiClient existente. O backend espera o cabeçalho Authorization no esquema Bearer com o Firebase ID token nas rotas autenticadas.
+- Não envie UID escolhido pelo cliente como substituto da autenticação. A API obtém o UID do token Firebase validado.
+- Preserve a URL base e os caminhos existentes: GET /obter-historico, POST /salvar-historico, DELETE /deletar-historico/{rota_id} e POST /subscription/verify.
+- Não adicione `/excluir-historico` nem considere `/atualizar-perfil` disponível até o backend ser implantado.
+- Não transforme falha de rede em liberação de compra, confirmação de exclusão ou confirmação de sincronização.
+
+6. TESTES E ENTREGA
+
+Adicione ou atualize testes unitários/instrumentados apropriados para os comportamentos alterados, seguindo a infraestrutura de testes existente. Cubra, quando aplicável:
+- Leitura de `pacotes_falhos` com valor não zero.
+- Compra com resposta 2xx de sucesso, HTTP não 2xx, corpo inválido e exceção de rede.
+- Exclusão sem chamada à rota `/excluir-historico` após falha.
+- Sincronização de e-mail com sucesso e com erro HTTP/rede, sem sucesso falso.
+
+Execute os testes relevantes e o build/checagem disponível para o módulo Android. Não declare os testes aprovados se não tiverem sido executados.
+
+Ao finalizar, reporte:
+1. Resumo objetivo das alterações.
+2. Arquivos alterados.
+3. Testes e build executados e seus resultados.
+4. Confirmação de que `PUT /atualizar-perfil` depende da publicação do backend na Vercel antes de ser usado em produção.
+
+
+BACKEND NECESSÁRIO PARA COMPLETAR O ALINHAMENTO (INFORMAÇÃO PARA COORDENAÇÃO)
+
+O backend atual já expõe `POST /subscription/verify`, `GET /obter-historico`, `POST /salvar-historico`, `DELETE /deletar-historico/{rota_id}` e, neste código local, `PUT /atualizar-perfil`. A rota de perfil precisa estar publicada na Vercel antes que o app em produção a chame. A resposta do histórico usa `pacotes_falhos`. Não se deve criar alias ou rotas de fallback só para contornar os problemas descritos.
+
+O endpoint foi implementado no backend local com autenticação Firebase, UID derivado do token validado, validação do e-mail, SQL parametrizado, respostas para perfil ausente/conflito/falha e sucesso somente após commit. Testes unitários cobrem validação, atualização bem-sucedida, perfil ausente, conflito e falha de banco. Ainda é necessário publicar o backend na Vercel antes ou em conjunto com a versão Android que chama a rota.
+
+Além disso, para verificar alinhamento completo em produção, confirmar no fonte real do app o comportamento do AuthInterceptor (Bearer Firebase ID token), executar testes/build do app e testar os contratos contra o backend implantado. A mudança do modo offline da consulta de assinatura não está incluída neste escopo porque requer decisão explícita de regra de negócio.
