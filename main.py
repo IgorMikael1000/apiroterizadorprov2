@@ -233,9 +233,9 @@ def verify_subscription(req: PurchaseVerification):
             traceback.print_exc()
         raise
     except Exception as e:
-        error_detail = traceback.format_exc()
-        print("ERRO DETALHADO:", error_detail)
-        raise HTTPException(status_code=500, detail=str(e))
+        error_trace = traceback.format_exc()
+        print(f"ERRO COMPLETO NA VERIFICAÇÃO:\n{error_trace}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @app.post("/webhooks/google-play")
 async def google_play_webhook(request: Request):
