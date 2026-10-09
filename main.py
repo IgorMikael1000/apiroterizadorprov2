@@ -21,6 +21,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 PACKAGE_NAME = os.getenv("PACKAGE_NAME", "app.itsolutions.roterizadorpro")
 GOOGLE_JSON_STR = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 MIGRATION_SQL = "ALTER TABLE assinaturas ADD COLUMN IF NOT EXISTS purchase_token TEXT;"
+BLOCK_APP_MIGRATION_SQL = (
+    "ALTER TABLE assinaturas "
+    "ADD COLUMN IF NOT EXISTS bloquear_app BOOLEAN NOT NULL DEFAULT FALSE;"
+)
 GOOGLE_API_TIMEOUT_SECONDS = 8
 
 app = FastAPI(
@@ -110,6 +114,7 @@ def ensure_purchase_token_column():
     cursor = conn.cursor()
     try:
         cursor.execute(MIGRATION_SQL)
+        cursor.execute(BLOCK_APP_MIGRATION_SQL)
         conn.commit()
     finally:
         cursor.close()
@@ -164,16 +169,36 @@ def status_assinatura(firebase_uid: str):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT status, data_vencimento FROM assinaturas WHERE firebase_uid = %s;", (firebase_uid,))
+        cursor.execute(
+            "SELECT status, data_vencimento, bloquear_app "
+            "FROM assinaturas WHERE firebase_uid = %s;",
+            (firebase_uid,),
+        )
         assinatura = cursor.fetchone()
 
         if assinatura:
-            status_atual, data_vencimento = assinatura[0], assinatura[1]
-            if datetime.now(data_vencimento.tzinfo) > data_vencimento and status_atual not in ['ATIVO']:
-                cursor.execute("UPDATE assinaturas SET status = 'VENCIDA' WHERE firebase_uid = %s", (firebase_uid,))
+            status_atual, data_vencimento, bloquear_app = assinatura
+            data_expirada = (
+                data_vencimento is not None
+                and datetime.now(data_vencimento.tzinfo) > data_vencimento
+            )
+            bloqueado = (
+                bloquear_app
+                or status_atual in {"INATIVO", "VENCIDO", "VENCIDA"}
+                or data_expirada
+            )
+            if data_expirada and status_atual not in {"INATIVO", "VENCIDO", "VENCIDA"}:
+                status_atual = "VENCIDO"
+                cursor.execute(
+                    "UPDATE assinaturas SET status = 'VENCIDO', bloquear_app = TRUE "
+                    "WHERE firebase_uid = %s",
+                    (firebase_uid,),
+                )
                 conn.commit()
-                return {"status": "VENCIDA", "bloquear_app": True}
-            return {"status": status_atual, "bloquear_app": False, "vence_em": data_vencimento}
+            resposta = {"status": status_atual, "bloquear_app": bloqueado}
+            if data_vencimento is not None:
+                resposta["vence_em"] = data_vencimento
+            return resposta
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     finally:
         cursor.close()
@@ -345,7 +370,8 @@ async def google_play_webhook(request: Request):
             raise HTTPException(status_code=400, detail="purchaseToken ausente.")
 
         if notification_type in {12, 13}:
-            status = "inativo"
+            status = "INATIVO"
+            bloquear_app = True
             expiry_date = None
             logging.info(
                 "RTDN tipo %s: desativando assinatura identificada pelo token ***%s.",
@@ -403,8 +429,10 @@ async def google_play_webhook(request: Request):
             )
             if has_access:
                 status = "ATIVO"
+                bloquear_app = False
             else:
                 status = "VENCIDA"
+                bloquear_app = True
                 expiry_date = datetime.now(timezone.utc).replace(tzinfo=None)
             if notification_type == 3:
                 logging.info(
@@ -428,17 +456,21 @@ async def google_play_webhook(request: Request):
         try:
             if notification_type in {12, 13}:
                 cursor.execute(
-                    "UPDATE assinaturas SET status = 'inativo' WHERE purchase_token = %s",
+                    """
+                    UPDATE assinaturas
+                    SET status = 'INATIVO', bloquear_app = TRUE
+                    WHERE purchase_token = %s
+                    """,
                     (purchase_token,),
                 )
             else:
                 cursor.execute(
                     """
                     UPDATE assinaturas
-                    SET status = %s, data_vencimento = %s
+                    SET status = %s, data_vencimento = %s, bloquear_app = %s
                     WHERE purchase_token = %s
                     """,
-                    (status, expiry_date, purchase_token),
+                    (status, expiry_date, bloquear_app, purchase_token),
                 )
             rows_updated = cursor.rowcount
             logging.info(
@@ -472,14 +504,18 @@ async def google_play_webhook(request: Request):
             conn.close()
 
         return {"status": "ok", "notification_type": notification_type}
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        logging.exception(
+            "Webhook Google Play acknowledged with HTTP 200 after processing error: %s",
+            exc.detail,
+        )
+        return {"status": "error", "detail": exc.detail}
     except Exception as exc:
         logging.exception("Falha ao processar RTDN do Google Play.")
-        raise HTTPException(
-            status_code=500,
-            detail="Falha ao processar notificação do Google Play.",
-        ) from exc
+        return {
+            "status": "error",
+            "detail": "Falha ao processar notificação do Google Play.",
+        }
 
 # --- HISTÓRICO DE ROTAS ---
 @app.post("/salvar-historico")
