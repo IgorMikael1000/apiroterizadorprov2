@@ -92,7 +92,7 @@ def write_export():
             output.write(f"\n{'=' * 80}\nARQUIVO: {relative_path}\n{'=' * 80}\n")
 
             if is_sensitive_file(path):
-                output.write("[Conteúdo omitido: arquivo sensível]\n")
+                output.write("[Conteúdo omitido: arquivo sensível.]\n")
                 continue
 
             try:
