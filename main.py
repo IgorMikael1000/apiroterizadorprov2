@@ -198,18 +198,36 @@ def verify_subscription(req: PurchaseVerification):
             "SUBSCRIPTION_STATE_ACTIVE",
             "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
         ]:
+            print(
+                "Verificação rejeitada: estado da assinatura não permite ativação. "
+                f"Estado recebido: {subscription_state!r}"
+            )
             raise HTTPException(status_code=400, detail="Pagamento não confirmado pela Google.")
 
+        line_items = sub_info.get("lineItems", [])
         matching_line_items = [
             item
-            for item in sub_info.get("lineItems", [])
+            for item in line_items
             if item.get("productId") == req.subscription_id
         ]
         if not matching_line_items:
+            returned_product_ids = [
+                item.get("productId") for item in line_items
+            ]
+            print(
+                "Verificação rejeitada: productId não corresponde. "
+                f"Recebido no pedido: {req.subscription_id!r}; "
+                f"productId(s) da Google: {returned_product_ids!r}"
+            )
             raise HTTPException(status_code=400, detail="Produto da assinatura não corresponde.")
 
         expiry_time = matching_line_items[0].get("expiryTime")
         if not expiry_time:
+            print(
+                "Verificação rejeitada: expiryTime ausente no item correspondente. "
+                f"productId: {req.subscription_id!r}; "
+                f"expiryTime recebido: {expiry_time!r}"
+            )
             raise HTTPException(status_code=400, detail="Data de expiração não encontrada na Google.")
         expiry_date = datetime.fromisoformat(
             expiry_time.replace("Z", "+00:00")
@@ -224,6 +242,10 @@ def verify_subscription(req: PurchaseVerification):
                 SET status = 'ATIVO', data_vencimento = %s, purchase_token = %s
                 WHERE firebase_uid = %s
             """, (expiry_date, req.purchase_token, req.firebase_uid))
+            print(
+                "UPDATE de assinatura executado. "
+                f"Usuário: {req.firebase_uid}; linhas afetadas: {cursor.rowcount}"
+            )
             if cursor.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Assinatura do usuário não encontrada.")
             conn.commit()
