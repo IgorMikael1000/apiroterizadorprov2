@@ -50,6 +50,16 @@ TRIAL_DEVICES_MIGRATION_SQL = """
     END
     $$;
 """
+APP_SETTINGS_MIGRATION_SQL = """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        latest_version_code INTEGER NOT NULL,
+        force_update BOOLEAN NOT NULL
+    );
+    INSERT INTO app_settings (id, latest_version_code, force_update)
+    VALUES (1, 21, TRUE)
+    ON CONFLICT (id) DO NOTHING;
+"""
 GOOGLE_API_TIMEOUT_SECONDS = 8
 
 app = FastAPI(
@@ -160,6 +170,12 @@ class PurchaseVerification(BaseModel):
 
     subscription_id: str
     purchase_token: str
+
+class AppSettingsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latest_version_code: int
+    force_update: bool
 
 
 def verify_firebase_token(request: Request) -> str:
@@ -279,6 +295,7 @@ def ensure_purchase_token_column():
         cursor.execute(MIGRATION_SQL)
         cursor.execute(BLOCK_APP_MIGRATION_SQL)
         cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS android_id TEXT;")
+        cursor.execute(APP_SETTINGS_MIGRATION_SQL)
         cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
             ("migration:dispositivos_trial:v1",),
@@ -292,6 +309,40 @@ def ensure_purchase_token_column():
 @app.on_event("startup")
 def startup_migration():
     ensure_purchase_token_column()
+
+
+@app.get("/api/v1/config/version", response_model=AppSettingsResponse)
+def get_app_version_config() -> AppSettingsResponse:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT latest_version_code, force_update "
+            "FROM app_settings WHERE id = 1"
+        )
+        settings = cursor.fetchone()
+        if settings is None:
+            logger.error("Configuração de versão do aplicativo não encontrada.")
+            raise HTTPException(
+                status_code=503,
+                detail="Configuração de versão do aplicativo indisponível.",
+            )
+        return AppSettingsResponse(
+            latest_version_code=settings[0],
+            force_update=settings[1],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Falha ao consultar a configuração de versão do aplicativo.")
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível consultar a configuração de versão.",
+        ) from exc
+    finally:
+        cursor.close()
+        conn.close()
+
 
 # --- ROTAS DE USUÁRIO ---
 @app.post("/registrar-usuario")

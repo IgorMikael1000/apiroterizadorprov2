@@ -134,6 +134,37 @@ class TrialDeviceRegistryTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (android_id) DO NOTHING", executed_sql)
         self.assertTrue(connection.committed)
 
+    def test_startup_migration_creates_app_settings_with_initial_version(self):
+        cursor = ScriptedCursor()
+        connection = ScriptedConnection(cursor)
+        with patch.object(main, "get_db_connection", return_value=connection):
+            main.ensure_purchase_token_column()
+
+        executed_sql = "\n".join(query for query, _ in cursor.queries)
+        self.assertIn("CREATE TABLE IF NOT EXISTS app_settings", executed_sql)
+        self.assertIn("latest_version_code INTEGER NOT NULL", executed_sql)
+        self.assertIn("force_update BOOLEAN NOT NULL", executed_sql)
+        self.assertIn("VALUES (1, 21, TRUE)", executed_sql)
+        self.assertIn("ON CONFLICT (id) DO NOTHING", executed_sql)
+        self.assertTrue(connection.committed)
+
+    def test_version_config_returns_database_settings_without_authentication(self):
+        cursor = ScriptedCursor(fetch_results=[(21, True)])
+        connection = ScriptedConnection(cursor)
+        with patch.object(main, "get_db_connection", return_value=connection):
+            response = main.get_app_version_config()
+
+        self.assertEqual(response, main.AppSettingsResponse(
+            latest_version_code=21,
+            force_update=True,
+        ))
+        self.assertIn(
+            ("SELECT latest_version_code, force_update FROM app_settings WHERE id = 1", None),
+            cursor.queries,
+        )
+        self.assertTrue(cursor.closed)
+        self.assertTrue(connection.closed)
+
 
 if __name__ == "__main__":
     unittest.main()
