@@ -144,11 +144,13 @@ class UsuarioNovo(BaseModel):
     email: str
     cpf: str
     android_id: str
+    telefone: str | None = None
 
 class AtualizacaoPerfil(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    email: EmailStr
+    email: EmailStr | None = None
+    telefone: str | None = None
 
 class RotaBackup(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -295,6 +297,7 @@ def ensure_purchase_token_column():
         cursor.execute(MIGRATION_SQL)
         cursor.execute(BLOCK_APP_MIGRATION_SQL)
         cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS android_id TEXT;")
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS telefone TEXT;")
         cursor.execute(APP_SETTINGS_MIGRATION_SQL)
         cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -302,6 +305,10 @@ def ensure_purchase_token_column():
         )
         cursor.execute(TRIAL_DEVICES_MIGRATION_SQL)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Falha ao aplicar migrações do banco de dados.")
+        raise
     finally:
         cursor.close()
         conn.close()
@@ -368,14 +375,15 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
         status_assinatura = "INATIVO" if trial_ja_ativado else "TRIAL"
 
         cursor.execute("""
-            INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO usuarios (firebase_uid, nome, email, cpf, android_id, telefone)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (firebase_uid) DO UPDATE SET
                 nome = EXCLUDED.nome,
                 email = EXCLUDED.email,
                 cpf = EXCLUDED.cpf,
-                android_id = EXCLUDED.android_id
-        """, (uid, user.nome, user.email, user.cpf, android_id))
+                android_id = EXCLUDED.android_id,
+                telefone = COALESCE(EXCLUDED.telefone, usuarios.telefone)
+        """, (uid, user.nome, user.email, user.cpf, android_id, user.telefone))
 
         data_vencimento = (
             datetime.now() + timedelta(days=7)
@@ -426,12 +434,26 @@ def atualizar_perfil(
     perfil: AtualizacaoPerfil,
     firebase_uid: str = Depends(verify_firebase_token),
 ):
+    updates = []
+    params = []
+    if perfil.email is not None:
+        updates.append("email = %s")
+        params.append(str(perfil.email))
+    if "telefone" in perfil.model_fields_set:
+        updates.append("telefone = %s")
+        params.append(perfil.telefone)
+    if not updates:
+        raise HTTPException(
+            status_code=422,
+            detail="Informe ao menos um campo para atualizar.",
+        )
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "UPDATE usuarios SET email = %s WHERE firebase_uid = %s",
-            (str(perfil.email), firebase_uid),
+            f"UPDATE usuarios SET {', '.join(updates)} WHERE firebase_uid = %s",
+            (*params, firebase_uid),
         )
         if cursor.rowcount == 0:
             conn.rollback()
@@ -440,9 +462,15 @@ def atualizar_perfil(
                 detail="Perfil do usuário não encontrado.",
             )
         conn.commit()
+        if len(updates) == 2:
+            mensagem = "Perfil atualizado com sucesso."
+        elif perfil.email is not None:
+            mensagem = "E-mail atualizado com sucesso."
+        else:
+            mensagem = "Telefone atualizado com sucesso."
         return {
             "status": "success",
-            "mensagem": "E-mail atualizado com sucesso.",
+            "mensagem": mensagem,
         }
     except errors.UniqueViolation as exc:
         conn.rollback()
@@ -455,12 +483,47 @@ def atualizar_perfil(
     except Exception as exc:
         conn.rollback()
         logger.exception(
-            "Falha ao atualizar o e-mail do usuário %s.",
+            "Falha ao atualizar o perfil do usuário %s.",
             firebase_uid,
         )
         raise HTTPException(
             status_code=500,
-            detail="Não foi possível atualizar o e-mail do usuário.",
+            detail="Não foi possível atualizar o perfil do usuário.",
+        ) from exc
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/obter-perfil")
+def obter_perfil(firebase_uid: str = Depends(verify_firebase_token)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT nome, email, cpf, android_id, telefone "
+            "FROM usuarios WHERE firebase_uid = %s",
+            (firebase_uid,),
+        )
+        perfil = cursor.fetchone()
+        if perfil is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Perfil do usuário não encontrado.",
+            )
+        return {
+            "nome": perfil[0],
+            "email": perfil[1],
+            "cpf": perfil[2],
+            "android_id": perfil[3],
+            "telefone": perfil[4],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Falha ao consultar o perfil do usuário %s.", firebase_uid)
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível consultar o perfil do usuário.",
         ) from exc
     finally:
         cursor.close()
@@ -840,11 +903,31 @@ async def google_play_webhook(
         }
 
 # --- HISTÓRICO DE ROTAS ---
+async def capturar_valores_historico_app(request: Request) -> dict[str, object]:
+    payload_app = await request.json()
+    return {
+        "consumo_kml": payload_app.get("consumo_kml"),
+        "preco_combustivel": payload_app.get("preco_combustivel"),
+    }
+
+
 @app.post("/salvar-historico")
 def salvar_historico(
     rota: RotaBackup,
+    valores_app: dict[str, object] = Depends(capturar_valores_historico_app),
     firebase_uid: str = Depends(verify_firebase_token),
 ):
+    valores_api = {
+        "consumo_kml": rota.consumo_kml,
+        "preco_combustivel": rota.preco_combustivel,
+    }
+    logger.info(
+        "Diagnóstico /salvar-historico: valores recebidos do app=%s; "
+        "valores validados pela API=%s",
+        valores_app,
+        valores_api,
+    )
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:

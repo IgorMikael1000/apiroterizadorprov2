@@ -47,12 +47,13 @@ class ScriptedConnection:
 
 
 class TrialDeviceRegistryTests(unittest.TestCase):
-    def fake_user(self, android_id="device-123"):
+    def fake_user(self, android_id="device-123", telefone=None):
         return main.UsuarioNovo(
             nome="Test",
             email="trial-test@example.com",
             cpf="00000000000",
             android_id=android_id,
+            telefone=telefone,
         )
 
     def run_registration(self, cursor, user=None):
@@ -74,6 +75,23 @@ class TrialDeviceRegistryTests(unittest.TestCase):
         )
         self.assertTrue(connection.committed)
         self.assertFalse(connection.rolled_back)
+
+    def test_registration_persists_phone_number(self):
+        cursor = ScriptedCursor(fetch_results=[(False,), ("TRIAL",)])
+        phone = "+5511999999999"
+        self.run_registration(cursor, user=self.fake_user(telefone=phone))
+
+        user_insert = next(
+            (query, params)
+            for query, params in cursor.queries
+            if "INSERT INTO usuarios" in query
+        )
+        self.assertIn("android_id, telefone", user_insert[0])
+        self.assertIn(
+            "telefone = COALESCE(EXCLUDED.telefone, usuarios.telefone)",
+            user_insert[0],
+        )
+        self.assertEqual(user_insert[1][-1], phone)
 
     def test_previously_trialed_device_is_inactive_and_not_reinserted(self):
         cursor = ScriptedCursor(fetch_results=[(True,), ("INATIVO",)])
@@ -132,6 +150,10 @@ class TrialDeviceRegistryTests(unittest.TestCase):
         self.assertIn("trial_ativado_em TIMESTAMPTZ", executed_sql)
         self.assertIn("INSERT INTO dispositivos_trial (android_id)", executed_sql)
         self.assertIn("ON CONFLICT (android_id) DO NOTHING", executed_sql)
+        self.assertIn(
+            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS telefone TEXT",
+            executed_sql,
+        )
         self.assertTrue(connection.committed)
 
     def test_startup_migration_creates_app_settings_with_initial_version(self):
