@@ -15,7 +15,7 @@
   "crons": [
     {
       "path": "/cron/ativar-novos-usuarios",
-      "schedule": "55 14 * * *"
+      "schedule": "30 18 * * *"
     }
   ]
 }
