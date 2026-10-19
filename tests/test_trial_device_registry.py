@@ -154,6 +154,10 @@ class TrialDeviceRegistryTests(unittest.TestCase):
             "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS telefone TEXT",
             executed_sql,
         )
+        self.assertIn(
+            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fcm_token TEXT",
+            executed_sql,
+        )
         self.assertTrue(connection.committed)
 
     def test_startup_migration_creates_app_settings_with_initial_version(self):

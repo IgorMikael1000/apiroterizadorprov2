@@ -8,7 +8,7 @@ import firebase_admin
 import psycopg2
 import psycopg2.extras
 from psycopg2 import errors
-from firebase_admin import auth, credentials
+from firebase_admin import auth, credentials, messaging
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, EmailStr
 from dotenv import load_dotenv
@@ -173,6 +173,13 @@ class PurchaseVerification(BaseModel):
     subscription_id: str
     purchase_token: str
 
+
+class FCMTokenUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fcm_token: str
+
+
 class AppSettingsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -298,6 +305,7 @@ def ensure_purchase_token_column():
         cursor.execute(BLOCK_APP_MIGRATION_SQL)
         cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS android_id TEXT;")
         cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS telefone TEXT;")
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
         cursor.execute(APP_SETTINGS_MIGRATION_SQL)
         cursor.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -428,6 +436,84 @@ def registrar_usuario(user: UsuarioNovo, uid: str = Depends(verify_firebase_toke
     finally:
         cursor.close()
         conn.close()
+
+
+@app.put("/atualizar-fcm-token")
+def atualizar_fcm_token(
+    token_update: FCMTokenUpdate,
+    firebase_uid: str = Depends(verify_firebase_token),
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE usuarios SET fcm_token = %s WHERE firebase_uid = %s",
+            (token_update.fcm_token, firebase_uid),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+        conn.commit()
+        return {"mensagem": "Token FCM atualizado com sucesso."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Falha ao atualizar o token FCM do usuário %s.", firebase_uid)
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível atualizar o token FCM.",
+        ) from exc
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/cron/ativar-novos-usuarios")
+def ativar_novos_usuarios():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT usuarios.fcm_token
+            FROM usuarios
+            JOIN dispositivos_trial
+                ON dispositivos_trial.android_id = usuarios.android_id
+            WHERE usuarios.fcm_token IS NOT NULL
+                AND dispositivos_trial.trial_ativado_em < NOW() - INTERVAL '24 hours'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM historico_rotas
+                    WHERE historico_rotas.firebase_uid = usuarios.firebase_uid
+                )
+        """)
+        tokens = cursor.fetchall()
+        sent_count = 0
+        for (fcm_token,) in tokens:
+            message = messaging.Message(
+                token=fcm_token,
+                notification=messaging.Notification(
+                    title="📦 Faça sua primeira rota hoje!",
+                    body=(
+                        "Você já tem o Roterizador Pro no celular. Crie sua primeira "
+                        "rota e veja como é fácil economizar horas de trabalho e "
+                        "combustível!"
+                    ),
+                ),
+            )
+            messaging.send(message)
+            sent_count += 1
+        return {"mensagem": "Notificações enviadas.", "quantidade": sent_count}
+    except Exception as exc:
+        logger.exception("Falha ao enviar notificações de ativação.")
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível enviar as notificações de ativação.",
+        ) from exc
+    finally:
+        cursor.close()
+        conn.close()
+
 
 @app.put("/atualizar-perfil")
 def atualizar_perfil(
